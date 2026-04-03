@@ -5,6 +5,8 @@
 # EASEIR
 EASEIR: Efficient and Adaptive Safe-set Estimation via Implicit Representation for High-dimensional Motion Planning
 
+![Example 0](./images/pipeline.png)
+
 Authors: [Hojun Lee](https://kidpaul94.github.io/), [Yuseop Sim](https://yuseopsim.github.io), Changheon Han, [Jiho Lee](https://www.jiholee.xyz/people), [Aniket Bera](https://www.cs.purdue.edu/homes/ab), [Martin B.G. Jun](https://web.ics.purdue.edu/~jun25/members.html)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
