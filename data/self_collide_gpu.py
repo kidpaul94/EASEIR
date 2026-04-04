@@ -13,8 +13,11 @@ Algorithm per batch of B joint configs:
   3. OR-reduce across all pairs → binary collision flag per config
 
 Output:
-  self_collision_map_gpu.npy  shape (N, 6)
-  columns: [j1, j2, j3, j4, j5, is_collision]  angles in DEGREES
+  self_collision_map_gpu.npy  shape (N,)  dtype uint32
+  Each element is a bit-packed encoding of 5 joint indices (J1–J5),
+  using the same scheme as efficiency_check.py.  J6 is fixed at 0
+  and not packed.  Decode with the shared _BITS / _ENC_SHIFTS / _ENC_LO
+  constants to recover joint angles in degrees.
 """
 
 import os
@@ -41,16 +44,45 @@ N_SURF_PTS     = 128      # surface points sampled per link mesh
 SDF_THRESHOLD  = 0.0      # SDF <= 0 → inside mesh → collision
 SDF_RESOLUTION = 0.01    # voxel resolution in metres
 
-# Joint limits (degrees) — joint 6 is held fixed at 0
+# Joint limits (degrees) — matches efficiency_check.py JOINT_DISCRETIZATION
 JOINT_LIMITS_DEG = {
-    0: np.arange(-180., 180., 5.0),   # Joint 1
-    1: np.arange(-90., 95., 5.0),   # Joint 2
-    2: np.arange(-145., 150., 5.0),   # Joint 3
-    3: np.arange(-180., 180., 5.0),   # Joint 4
-    4: np.arange(-180., 180., 5.0),   # Joint 5
+    0: np.arange(-180., 180., 10.0),   # Joint 1
+    1: np.arange(-180., 180., 10.0),   # Joint 2  (was -90..95)
+    2: np.arange(-150., 150., 10.0),   # Joint 3  (was -145..150)
+    3: np.arange(-180., 180., 10.0),   # Joint 4
+    4: np.arange(-180., 180., 10.0),   # Joint 5
+    5: np.arange(   0.,   1.,  1.0),   # Joint 6  fixed at 0
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Encoding constants (mirrors efficiency_check.py) ─────────────────────────
+# J6 is fixed at 0 and not packed — only J1–J5 are encoded.
+N_PACKED    = 5
+_ENC_LO     = torch.tensor([-180., -180., -150., -180., -180.], dtype=torch.float32)
+_ENC_STEP   = torch.tensor([  10.,   10.,   10.,   10.,   10.], dtype=torch.float32)
+_NVALS      = [(hi - lo) // st
+               for lo, hi, st in [(-180,180,10),(-180,180,10),(-150,150,10),
+                                   (-180,180,10),(-180,180,10)]]
+_BITS       = [int(np.ceil(np.log2(n))) if n > 1 else 1 for n in _NVALS]
+_ENC_SHIFTS = [sum(_BITS[:i]) for i in range(N_PACKED)]
+assert sum(_BITS) <= 32, f"Packed representation needs {sum(_BITS)} bits — exceeds uint32."
+
+
+def encode_configs(configs_deg: torch.Tensor) -> np.ndarray:
+    """
+    Bit-pack a batch of joint configs (degrees) into uint32 values.
+    Matches the encoding used by efficiency_check.py.
+    configs_deg: (B, 5) float32 tensor of J1–J5 angles in degrees.
+    Returns: (B,) numpy array of dtype uint32.
+    """
+    dev      = configs_deg.device
+    enc_lo   = _ENC_LO.to(dev)
+    enc_step = _ENC_STEP.to(dev)
+    idx      = ((configs_deg[:, :N_PACKED] - enc_lo) / enc_step).round().to(torch.int32)
+    packed   = torch.zeros(configs_deg.shape[0], dtype=torch.int32, device=dev)
+    for i in range(N_PACKED):
+        packed |= idx[:, i] << _ENC_SHIFTS[i]
+    return packed.cpu().numpy().view(np.uint32)
+
 
 def build_chain(urdf_path: str) -> pk.SerialChain:
     chain = pk.build_serial_chain_from_urdf(open(urdf_path).read(), END_LINK)
@@ -216,19 +248,17 @@ def check_batch(
 
 
 def total_configs() -> int:
+    # J6 has only one value (0), so it does not multiply the count.
     return int(np.prod([len(v) for v in JOINT_LIMITS_DEG.values()]))
 
 
 def joint_config_generator(batch_size: int):
     """
-    Fully lazy joint config generator — only j3×j4×j5 (~77 MB) lives in RAM.
+    Fully lazy joint config generator — only j3×j4×j5 lives in RAM.
     Outer loops over j1 and j2 are pure Python iteration.
+    J6 is fixed at 0 and appended as a constant column so FK can pad correctly.
 
-    Memory breakdown:
-      inner comb (j3×j4×j5): 149×180×180 = 4.8M rows × 4 cols × 4B = ~77 MB
-      one batch buffer      : batch_size  × 5 cols × 4B (e.g. 1k rows = 20 KB)
-
-    Matches data_gen.py ordering: outer j2, inner cartesian(j1, j3, j4, j5).
+    Yields (configs_deg, configs_rad) where configs_deg is (B, 6) float32.
     """
     j1 = torch.tensor(JOINT_LIMITS_DEG[0], dtype=torch.float32)
     j2 = torch.tensor(JOINT_LIMITS_DEG[1], dtype=torch.float32)
@@ -236,10 +266,10 @@ def joint_config_generator(batch_size: int):
     j4 = torch.tensor(JOINT_LIMITS_DEG[3], dtype=torch.float32)
     j5 = torch.tensor(JOINT_LIMITS_DEG[4], dtype=torch.float32)
 
-    # Smallest safe inner grid: j3 × j4 × j5 (~77 MB)
+    # Smallest safe inner grid: j3 × j4 × j5
     inner = torch.stack(
         torch.meshgrid(j3, j4, j5, indexing='ij'), dim=-1
-    ).reshape(-1, 3)   # (K, 3)  K = len(j3)*len(j4)*len(j5)
+    ).reshape(-1, 3)   # (K, 3)
     K = len(inner)
 
     buf     = []
@@ -247,12 +277,14 @@ def joint_config_generator(batch_size: int):
 
     for j2_val in j2:
         for j1_val in j1:
-            # One (j1, j2) slice: K rows, columns = [j1, j2, j3, j4, j5]
+            # One (j1, j2) slice: K rows, columns = [j1, j2, j3, j4, j5, j6=0]
+            zeros = torch.zeros(K, 1)
             row = torch.cat([
                 j1_val.expand(K, 1),
                 j2_val.expand(K, 1),
-                inner,             # j3, j4, j5
-            ], dim=1)              # (K, 5)
+                inner,              # j3, j4, j5
+                zeros,              # j6 fixed at 0
+            ], dim=1)               # (K, 6)
 
             buf.append(row)
             buf_len += K
@@ -315,12 +347,14 @@ def generate_collision_map(
             total_written   += len(flags)
             total_collision += int(flags.sum())
 
-            # Keep only colliding rows — no flag column needed since all rows collide
-            colliding_batch = configs_deg.numpy()[flags.astype(bool)]
-            if len(colliding_batch) > 0:
-                np.save(f, colliding_batch)
+            # Encode colliding configs as uint32 (J1–J5 bit-packed, J6 omitted)
+            colliding_mask = flags.astype(bool)
+            if colliding_mask.any():
+                colliding_deg = configs_deg[colliding_mask]   # (M, 6) torch tensor
+                encoded = encode_configs(colliding_deg)        # (M,) uint32 numpy
+                np.save(f, encoded)
 
-    # Consolidate streamed collision-only batches into one .npy file
+    # Consolidate streamed uint32 chunks into one .npy file
     print("\nConsolidating batches...")
     chunks = []
     with open(tmp_path, "rb") as f:
@@ -332,21 +366,27 @@ def generate_collision_map(
     os.remove(tmp_path)
 
     if chunks:
-        data = np.vstack(chunks)   # (N_colliding, 5): [j1, j2, j3, j4, j5]
+        data = np.concatenate(chunks).view(np.uint32)   # (N_colliding,) uint32
     else:
-        data = np.empty((0, 5), dtype=np.float32)
+        data = np.empty(0, dtype=np.uint32)
     np.save(output_path, data)
 
     print(f"Saved  -> {output_path}")
-    print(f"Shape  : {data.shape}  (colliding configs only, no flag column)")
+    print(f"Shape  : {data.shape}  dtype={data.dtype}  (colliding configs, bit-packed)")
+    print(f"Encoding: {_BITS} bits per joint, shifts={_ENC_SHIFTS}  ({sum(_BITS)}/32 bits used)")
     print(f"Collision rate: {total_collision / max(total_written, 1):.2%}")
 
 
 def load_and_query(map_path: str, query_angles_deg: np.ndarray) -> bool:
-    """Return True if query config (degrees) is in the collision map (nearest grid point)."""
-    data  = np.load(map_path)          # (N_colliding, 5): all rows are collisions
-    dists = np.linalg.norm(data - query_angles_deg, axis=1)
-    return bool(np.min(dists) < 5.0)   # threshold: within 5 deg = collision
+    """
+    Return True if query config (degrees, J1–J5) is in the collision map.
+    The map stores bit-packed uint32 values — encode the query first,
+    then check for an exact match (grid-snapped to the nearest 10-degree step).
+    """
+    data     = np.load(map_path).view(np.uint32)   # (N_colliding,)
+    q_tensor = torch.tensor(query_angles_deg[:N_PACKED], dtype=torch.float32).unsqueeze(0)
+    q_packed = encode_configs(q_tensor)[0]          # scalar uint32
+    return bool(np.any(data == q_packed))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
